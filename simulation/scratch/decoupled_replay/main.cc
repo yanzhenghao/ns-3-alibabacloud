@@ -12,7 +12,10 @@
  * Must return EMPTY.
  *
  * CLI arguments:
- *   -f, --flow-file      Path to flow file (required)
+ *   -f, --flow-file      Path to flow file (single-task or pre-merged)
+ *   -m, --manifest       Path to multi-task scenario manifest (mutually exclusive
+ *                        with -f). Replays N single-task flow files concurrently
+ *                        with per-task staggered arrival (start_ns).
  *   -t, --topo-dir       Topology directory (e.g., Spectrum-X_128g_...)
  *   -c, --config         SimAI.conf path (default: topo-dir/SimAI.conf)
  *   -o, --fct-output     FCT output file (default: fct.txt)
@@ -23,6 +26,7 @@
 
 #include "common_types.h"
 #include "flow_reader.h"
+#include "manifest_reader.h"
 #include "topology_reader.h"
 #include "flow_sender.h"
 #include "fct_writer.h"
@@ -31,6 +35,7 @@
 #include <cstring>
 #include <iostream>
 #include <csignal>
+#include <map>
 
 // Global scheduler pointer for signal handler / early exit reporting
 static DepScheduler* g_scheduler = nullptr;
@@ -55,6 +60,7 @@ int main(int argc, char *argv[]) {
     std::string topo_dir = "";
     std::string config_path = "";
     std::string flow_file_path = "";
+    std::string manifest_path = "";
     double sim_stop_time = 2000000000.0;  // effectively no limit
     bool dump_layer_stats = false;
     bool verify_dag = false;
@@ -68,6 +74,8 @@ int main(int argc, char *argv[]) {
             config_path = argv[++i];
         } else if ((arg == "-f" || arg == "--flow-file") && i + 1 < argc) {
             flow_file_path = argv[++i];
+        } else if ((arg == "-m" || arg == "--manifest") && i + 1 < argc) {
+            manifest_path = argv[++i];
         } else if ((arg == "-o" || arg == "--fct-output") && i + 1 < argc) {
             fct_output_file = argv[++i];
         } else if ((arg == "-s" || arg == "--stop-time") && i + 1 < argc) {
@@ -78,7 +86,10 @@ int main(int argc, char *argv[]) {
             dump_layer_stats = true;
         } else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [OPTIONS]\n"
-                      << "  -f, --flow-file PATH    Flow file to replay (required)\n"
+                      << "  -f, --flow-file PATH    Flow file to replay (single-task or pre-merged)\n"
+                      << "  -m, --manifest PATH     Multi-task scenario manifest (exclusive with -f);\n"
+                      << "                          replays N single-task flow files concurrently\n"
+                      << "                          with per-task staggered arrival (start_ns)\n"
                       << "  -t, --topo-dir DIR      Topology directory\n"
                       << "  -c, --config PATH       Config file (default: topo-dir/SimAI.conf)\n"
                       << "  -o, --fct-output PATH   FCT output file (default: fct.txt)\n"
@@ -90,8 +101,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (flow_file_path.empty()) {
-        std::cerr << "ERROR: --flow-file is required. Use -h for help." << std::endl;
+    if (flow_file_path.empty() && manifest_path.empty()) {
+        std::cerr << "ERROR: one of --flow-file or --manifest is required. Use -h for help."
+                  << std::endl;
+        return 1;
+    }
+    if (!flow_file_path.empty() && !manifest_path.empty()) {
+        std::cerr << "ERROR: --flow-file and --manifest are mutually exclusive. Use -h for help."
+                  << std::endl;
         return 1;
     }
 
@@ -118,14 +135,31 @@ int main(int argc, char *argv[]) {
     SetupNetwork(qp_finish, send_finish);
 
     // =====================================================================
-    // Step 3: Load flows from file
+    // Step 3: Load flows — either one flow file (-f) or a multi-task manifest (-m)
     // =====================================================================
-    std::cout << "[DecoupledReplay] Loading flows from " << flow_file_path << "..." << std::endl;
     BucketMetaMap bucket_meta;
     int file_send_lat = -1;
-    std::vector<FlowFileRecord> flows = LoadFlows(flow_file_path, bucket_meta, &file_send_lat);
+    std::vector<FlowFileRecord> flows;
+    std::map<uint32_t, uint64_t> job_start_ns;  // empty for -f → all start at t=0
+
+    if (!manifest_path.empty()) {
+        std::cout << "[DecoupledReplay] Loading scenario manifest " << manifest_path
+                  << "..." << std::endl;
+        std::vector<ManifestEntry> tasks = ParseManifest(manifest_path);
+        if (tasks.empty()) {
+            std::cerr << "ERROR: no tasks loaded from manifest " << manifest_path << std::endl;
+            return 1;
+        }
+        if (!LoadJobsFromManifest(tasks, flows, bucket_meta, job_start_ns, &file_send_lat)) {
+            std::cerr << "ERROR: failed to assemble jobs from manifest " << manifest_path << std::endl;
+            return 1;
+        }
+    } else {
+        std::cout << "[DecoupledReplay] Loading flows from " << flow_file_path << "..." << std::endl;
+        flows = LoadFlows(flow_file_path, bucket_meta, &file_send_lat);
+    }
     if (flows.empty()) {
-        std::cerr << "ERROR: No flows loaded from " << flow_file_path << std::endl;
+        std::cerr << "ERROR: No flows loaded." << std::endl;
         return 1;
     }
     std::cout << "[DecoupledReplay] Loaded " << flows.size() << " flows, "
@@ -180,6 +214,10 @@ int main(int argc, char *argv[]) {
         std::cerr << "ERROR: DepScheduler::Init failed" << std::endl;
         return 1;
     }
+
+    // Apply per-task staggered arrival from the manifest (no-op for -f: the map is
+    // empty, so every job starts at t=0 exactly as before).
+    scheduler.SetJobStartOffsets(job_start_ns);
 
     // DAG cycle detection — always run. A cyclic parent_flow_id graph is always
     // upstream corruption; without this the cycle's flows keep pending_deps>0

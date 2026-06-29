@@ -208,6 +208,15 @@ public:
     }
 
     // ------------------------------------------------------------------
+    // SetJobStartOffsets: per-job absolute arrival time (ns), keyed by job_id.
+    // Call after Init() and before Start(). Jobs absent from the map start at 0.
+    // Used to replay a STAGGERED multi-task scenario (manifest start_ns).
+    // ------------------------------------------------------------------
+    void SetJobStartOffsets(const std::map<uint32_t, uint64_t>& start_ns) {
+        _job_start_ns = start_ns;
+    }
+
+    // ------------------------------------------------------------------
     // Start: kick off the simulation — unlock bucket 0 (after its compute gap)
     // ------------------------------------------------------------------
     void Start() {
@@ -222,13 +231,21 @@ public:
         for (uint32_t job : _jobs) {
             _current_unlocked_bucket[job] = -1;
             _bucket_unlock_scheduled[job] = false;
-            uint64_t delay = 0;
+            uint64_t compute = 0;
             auto it = _bucket_compute_before.find(JobBucket{job, 0});
-            if (it != _bucket_compute_before.end()) delay = it->second;
+            if (it != _bucket_compute_before.end()) compute = it->second;
+            // Staggered arrival: add this job's absolute start_ns (manifest) on
+            // top of its real bucket-0 compute gap. Arrival and compute stay
+            // separate inputs; only their sum gates the first injection.
+            uint64_t start = 0;
+            auto sit = _job_start_ns.find(job);
+            if (sit != _job_start_ns.end()) start = sit->second;
+            uint64_t delay = start + compute;
             if (delay > 0) {
                 _bucket_unlock_scheduled[job] = true;
-                std::cout << "[DepScheduler] Job " << job << " bucket 0 compute gap: "
-                          << delay << " ns" << std::endl;
+                std::cout << "[DepScheduler] Job " << job << " bucket 0 unlock @"
+                          << delay << " ns (start_ns=" << start
+                          << " + compute=" << compute << ")" << std::endl;
                 Simulator::Schedule(NanoSeconds(delay),
                                     &DepScheduler::DoUnlockBucket, this, packJB(job, 0));
             } else {
@@ -526,6 +543,11 @@ private:
     std::map<uint32_t, int> _max_bucket;               // job_id -> max bucket
     std::map<uint32_t, bool> _bucket_unlock_scheduled; // job_id -> compute-gap timer pending
     std::set<uint32_t> _jobs;                           // all job_ids present
+    // Per-job absolute arrival time (ns). Empty → all jobs start at t=0 (the
+    // single-file default; behavior unchanged). Set from a scenario manifest via
+    // SetJobStartOffsets() to model STAGGERED arrival (task A at 0, B joins later,
+    // C later still). Added on top of bucket 0's compute gap in Start().
+    std::map<uint32_t, uint64_t> _job_start_ns;
     bool _started = false;
     std::map<JobBucket, int> _bucket_flow_count;       // (job,bucket) -> total flows
     std::map<JobBucket, int> _bucket_completed;        // (job,bucket) -> completed flows
