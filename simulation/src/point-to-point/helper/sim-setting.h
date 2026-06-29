@@ -13,6 +13,13 @@ public:
 	uint32_t win; // window bound
 
 	void Serialize(FILE* file){
+		// Guard against a NULL FILE* (e.g. fopen failed because the configured
+		// output directory does not exist). On macOS fwrite(NULL) blocks in
+		// flockfile and the process appears to hang; fail gracefully instead.
+		if (file == nullptr) {
+			fprintf(stderr, "[SimSetting] WARNING: output file is NULL, skipping Serialize (check *_OUTPUT_FILE paths in the .conf)\n");
+			return;
+		}
 		// write port_speed
 		uint32_t len = 0;
 		for (auto i: port_speed)
@@ -29,6 +36,10 @@ public:
 		fwrite(&win, sizeof(win), 1, file);
 	}
 	void Deserialize(FILE *file){
+		if (file == nullptr) {
+			fprintf(stderr, "[SimSetting] WARNING: input file is NULL, skipping Deserialize\n");
+			return;
+		}
 		int ret;
 		// read port_speed
 		uint32_t len;

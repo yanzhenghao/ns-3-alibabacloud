@@ -21,6 +21,16 @@ endif()
 # ##############################################################################
 project(NS3 CXX)
 
+# macOS portability: ns-3 module shared libraries (e.g. point-to-point) reference
+# cross-module symbols (MtpInterface, Ipv4Header, ...) that are only resolved at the
+# final executable link on Linux, where .so files permit undefined symbols. macOS .dylib
+# linking is strict and fails with "symbol(s) not found for architecture arm64". Defer
+# resolution to load time so the dylibs link, matching Linux behavior.
+if(APPLE)
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS " -undefined dynamic_lookup")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -undefined dynamic_lookup")
+endif()
+
 file(STRINGS VERSION NS3_VER)
 
 # minimum compiler versions

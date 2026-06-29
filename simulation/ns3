@@ -1,4 +1,4 @@
-#! /usr/bin/env python3
+#!/opt/homebrew/bin/python3.13
 
 import argparse
 import atexit
@@ -97,8 +97,10 @@ def parse_args(argv):
 
     parser_configure = sub_parser.add_parser('configure',
                                              help='Try "./ns3 configure --help" for more configuration options')
-    parser_configure.add_argument('configure',
-                                  action='store_true', default=False)
+    # Python 3.13+ rejects action='store_true' on a positional argument (it is only
+    # valid for optionals). The subparser name already dispatches "configure", so set
+    # the flag via a default instead of a (redundant) positional argument.
+    parser_configure.set_defaults(configure=True)
     parser_configure.add_argument('-d', '--build-profile',
                                   help='Build profile',
                                   dest='build_profile',
