@@ -6,37 +6,42 @@
  * DECOUPLED REPLAY: Multi-task manifest parser + multi-job assembler.
  *
  * A manifest describes a concurrent multi-task SCENARIO: how many tasks, each
- * task's name, and each task's absolute arrival time (start_ns). The actual
- * traffic lives in N separate SINGLE-TASK flow files (each one untouched, exactly
- * as the coupled sim / flowgen emitted it). This keeps WORKLOAD (the flow files)
- * cleanly separate from SCENARIO (arrival/placement) so one flow file can be
- * reused across many scenarios without re-merging.
+ * task's name, each task's GPU count, and each task's absolute arrival time
+ * (start_ns). The actual traffic lives in N separate SINGLE-TASK flow files
+ * (each one with job-local GPU IDs [0..gpu_num-1]). LoadJobsFromManifest
+ * remaps flow-ids AND GPU-rank-ids (src/dst/prev) into disjoint ranges so
+ * tasks occupy non-overlapping GPU nodes in the shared fabric topology.
  *
  * Manifest format (plain text):
  *
  *   TASKS 3
- *   task: A  flow: jobA_flows.txt  start_ns: 0
- *   task: B  flow: jobB_flows.txt  start_ns: 20000
- *   task: C  flow: jobC_flows.txt  start_ns: 50000
+ *   task: A  flow: jobA_flows.txt  start_ns: 0      gpus: 8
+ *   task: B  flow: jobB_flows.txt  start_ns: 20000   gpus: 16
+ *   task: C  flow: jobC_flows.txt  start_ns: 50000   gpus: 32
  *
  *   - First non-blank/non-comment line: "TASKS <n>".
- *   - Then exactly <n> "task:" lines. Each carries name / flow / start_ns in any
- *     order (parsed by key, like the bucket metadata lines in flow_reader.h).
+ *   - Then exactly <n> "task:" lines. Each carries name / flow / start_ns /
+ *     gpus in any order (parsed by key, like the bucket metadata lines in
+ *     flow_reader.h).
  *   - "flow:" paths are resolved relative to the MANIFEST file's directory
  *     (absolute paths are used verbatim).
+ *   - "gpus:" is REQUIRED — the GPU count for this task, used as the
+ *     rank_base offset so each task lands on a disjoint GPU range.
  *   - Lines starting with '#' and blank lines are ignored.
  *
  * Assembly (LoadJobsFromManifest):
- *   Each single-task flow file numbers flow_id from 0 and is internally job 0.
- *   Running N of them concurrently in one DepScheduler requires:
- *     - flow_id / parent_flow_id[] / child_flow_id[] offset by a per-job flow_base
- *       (cumulative flow count) so the global flow-id space stays collision-free
- *       and the dependency DAG stays self-consistent.
- *     - job_id stamped = task index i (overriding the file's 0) so the scheduler's
- *       per-job bucket frontier advances each task independently.
- *   src/dst/prev are NOT touched: GPU/NPU placement (npu_matrix) is handled
- *   externally — the flow files arriving here are already in the shared fabric's
- *   global node space, on disjoint GPUs.
+ *   Each single-task flow file numbers flow_id from 0 and addresses GPUs
+ *   with job-local IDs [0..gpu_num-1]. Running N of them concurrently in
+ *   one DepScheduler requires:
+ *     - flow_id / parent_flow_id[] / child_flow_id[] offset by a per-job
+ *       flow_base (cumulative flow count) so the global flow-id space stays
+ *       collision-free and the dependency DAG stays self-consistent.
+ *     - src / dst / prev[] offset by a per-job rank_base (cumulative GPU
+ *       count) so each task occupies a disjoint GPU node range.
+ *     - job_id stamped = task index i (overriding the file's 0) so the
+ *       scheduler's per-job bucket frontier advances each task independently.
+ *
+ *   This is the -m contract equivalent of merge_flows.py's --job remapping.
  */
 
 #ifndef __DECOUPLED_MANIFEST_READER_H__
@@ -59,6 +64,7 @@ struct ManifestEntry {
     std::string name;
     std::string flow_path;   // resolved relative to the manifest's directory
     uint64_t start_ns = 0;   // absolute arrival time of this task's first collective
+    uint32_t gpu_num = 0;    // GPU count for this task (for rank_base offset in multi-task assembly)
 };
 
 // Directory portion of a path (everything up to and including the last '/'),
@@ -100,6 +106,11 @@ inline std::vector<ManifestEntry> ParseManifest(const std::string& manifest_path
         ls >> tok;
 
         if (tok == "TASKS") {
+            if (declared >= 0) {
+                std::cerr << "[ParseManifest] ERROR: duplicate 'TASKS' declaration: "
+                          << raw << std::endl;
+                return std::vector<ManifestEntry>{};
+            }
             if (!(ls >> declared) || declared < 0) {
                 std::cerr << "[ParseManifest] ERROR: bad 'TASKS <n>' line: "
                           << raw << std::endl;
@@ -110,29 +121,40 @@ inline std::vector<ManifestEntry> ParseManifest(const std::string& manifest_path
 
         if (tok == "task:") {
             // Parse key/value pairs in any order: name / flow / start_ns.
+            // A token ending in ':' is a key (read its value from the next token);
+            // a bare word (no trailing ':') is the implicit name.
             ManifestEntry e;
             bool have_flow = false;
             std::string key;
-            // We already consumed "task:"; the next token is the name value.
-            // Treat "task:" specially as the leading key whose value is `name`.
-            ls >> e.name;
             while (ls >> key) {
-                if (key == "flow:") {
-                    std::string p; ls >> p;
-                    e.flow_path = (!p.empty() && p[0] == '/') ? p : base_dir + p;
-                    have_flow = true;
-                } else if (key == "start_ns:") {
-                    ls >> e.start_ns;
-                } else if (key == "name:") {
-                    ls >> e.name;  // allow explicit "name:" override
+                if (key.back() == ':') {
+                    if (key == "flow:") {
+                        std::string p; ls >> p;
+                        e.flow_path = (!p.empty() && p[0] == '/') ? p : base_dir + p;
+                        have_flow = true;
+                    } else if (key == "start_ns:") {
+                        ls >> e.start_ns;
+                    } else if (key == "gpus:") {
+                        ls >> e.gpu_num;
+                    } else if (key == "name:") {
+                        ls >> e.name;
+                    } else {
+                        std::cerr << "[ParseManifest] WARNING: unknown key '" << key
+                                  << "' in: " << raw << std::endl;
+                        std::string ignore; ls >> ignore;  // skip its value
+                    }
                 } else {
-                    std::cerr << "[ParseManifest] WARNING: unknown key '" << key
-                              << "' in: " << raw << std::endl;
-                    std::string ignore; ls >> ignore;  // skip its value
+                    // Bare word — the name (first one wins; "name:" can override later).
+                    if (e.name.empty()) e.name = key;
                 }
             }
             if (!have_flow || e.flow_path.empty()) {
                 std::cerr << "[ParseManifest] ERROR: task line missing 'flow:': "
+                          << raw << std::endl;
+                return std::vector<ManifestEntry>{};
+            }
+            if (e.gpu_num == 0) {
+                std::cerr << "[ParseManifest] ERROR: task line missing 'gpus:': "
                           << raw << std::endl;
                 return std::vector<ManifestEntry>{};
             }
@@ -185,6 +207,7 @@ inline bool LoadJobsFromManifest(const std::vector<ManifestEntry>& entries,
     start_ns_out.clear();
 
     uint32_t flow_base = 0;       // cumulative flow count = this job's flow-id offset
+    uint32_t rank_base = 0;       // cumulative GPU count = this job's src/dst/prev offset
     int agreed_send_lat = -1;     // first job's recorded send_lat; later jobs must match
 
     for (size_t i = 0; i < entries.size(); i++) {
@@ -218,10 +241,18 @@ inline bool LoadJobsFromManifest(const std::vector<ManifestEntry>& entries,
             }
         }
 
-        // 3) Offset FLOW-ids into a disjoint range + stamp job_id. Placement
-        //    (src/dst/prev) is left untouched — handled externally (npu_matrix).
+        // 3) Offset FLOW-ids into a disjoint range, REMAP GPU-rank IDs
+        //    (src/dst/prev) by rank_base so each task occupies a disjoint GPU
+        //    range, and stamp job_id. Flow files carry job-local GPU IDs
+        //    [0..gpu_num-1]; the rank_base rebase places them in the shared
+        //    fabric's global node space. NVSwitch IDs (NVLS/NVLS_TREE flows)
+        //    are handled by simple offset — the NVSwitch-node id space mirrors
+        //    the GPU server topology, so the same rank_base offset is correct.
         for (FlowFileRecord& r : flows) {
             r.flow_id += flow_base;
+            r.src += rank_base;
+            r.dst += rank_base;
+            for (uint32_t& p : r.prev) p += rank_base;
             for (uint32_t& p : r.parent_flow_id) p += flow_base;
             for (uint32_t& c : r.child_flow_id)  c += flow_base;
             r.job_id = job_id;
@@ -239,8 +270,22 @@ inline bool LoadJobsFromManifest(const std::vector<ManifestEntry>& entries,
         start_ns_out[job_id] = e.start_ns;
         std::cout << "[LoadJobsFromManifest] task " << job_id << " (" << e.name
                   << "): " << flows.size() << " flows, flow_base=" << flow_base
+                  << ", rank_base=" << rank_base << " (GPUs "
+                  << rank_base << ".." << (rank_base + e.gpu_num - 1) << ")"
                   << ", start_ns=" << e.start_ns << std::endl;
+        // Guard against uint32_t overflow: flow_id / parent_flow_id / child_flow_id
+        // are all uint32_t; exceeding 2^32 total flows produces silent DAG corruption.
+        if ((uint64_t)flow_base + flows.size() > UINT32_MAX) {
+            std::cerr << "[LoadJobsFromManifest] ERROR: total flow count would overflow"
+                      << " uint32_t flow_id space (flow_base=" << flow_base
+                      << " + " << flows.size() << " = "
+                      << ((uint64_t)flow_base + flows.size()) << " > " << UINT32_MAX << ")"
+                      << std::endl;
+            flows_out.clear();
+            return false;
+        }
         flow_base += (uint32_t)flows.size();
+        rank_base += e.gpu_num;
     }
 
     if (send_lat_us_out && agreed_send_lat > 0) *send_lat_us_out = agreed_send_lat;
